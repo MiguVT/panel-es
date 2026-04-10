@@ -1125,7 +1125,6 @@
             "pullingImage": "Tu servidor está descargando su imagen de Docker. Espera...",
             "pulling": "Descargando",
             "extracting": "Extrayendo",
-            "layer": "Capa"
           },
           "tooltip": {
             "search": "Buscar",
