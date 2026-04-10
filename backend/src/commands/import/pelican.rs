@@ -12,21 +12,79 @@ use std::{
     sync::Arc,
 };
 
+#[inline]
+fn first_import_tag(raw_tags: Option<&str>, fallback: &str) -> compact_str::CompactString {
+    raw_tags
+        .and_then(|raw_tags| serde_json::from_str::<Vec<String>>(raw_tags).ok())
+        .and_then(|tags| {
+            tags.into_iter().find_map(|tag| {
+                let tag = tag.trim();
+                (!tag.is_empty()).then(|| tag.to_compact_string())
+            })
+        })
+        .unwrap_or_else(|| fallback.to_compact_string())
+}
+
+#[inline]
+fn derive_name_parts(username: &str) -> (compact_str::CompactString, compact_str::CompactString) {
+    (
+        username.to_compact_string(),
+        compact_str::CompactString::default(),
+    )
+}
+
+async fn connect_source_database() -> Result<sqlx::Pool<sqlx::MySql>, anyhow::Error> {
+    let connection = std::env::var("DB_CONNECTION")
+        .unwrap_or_else(|_| "mysql".to_string())
+        .trim_matches('"')
+        .to_ascii_lowercase();
+
+    if !matches!(connection.as_str(), "mysql" | "mariadb") {
+        return Err(anyhow::anyhow!(
+            "unsupported source database driver `{connection}`; expected mysql or mariadb"
+        ));
+    }
+
+    let host = std::env::var("DB_HOST").context("failed to read pelican environment DB_HOST")?;
+    let port = std::env::var("DB_PORT")
+        .unwrap_or_else(|_| "3306".to_string())
+        .parse::<u16>()
+        .context("failed to parse pelican environment DB_PORT")?;
+    let database =
+        std::env::var("DB_DATABASE").context("failed to read pelican environment DB_DATABASE")?;
+    let username =
+        std::env::var("DB_USERNAME").context("failed to read pelican environment DB_USERNAME")?;
+    let password =
+        std::env::var("DB_PASSWORD").context("failed to read pelican environment DB_PASSWORD")?;
+
+    let options = sqlx::mysql::MySqlConnectOptions::new()
+        .host(host.trim_matches('"'))
+        .port(port)
+        .database(database.trim_matches('"'))
+        .username(username.trim_matches('"'))
+        .password(password.trim_matches('"'));
+
+    sqlx::mysql::MySqlPoolOptions::new()
+        .connect_with(options)
+        .await
+        .with_context(|| format!("failed to connect to source database using `{connection}`"))
+}
+
 #[derive(Args)]
-pub struct PterodactylArgs {
+pub struct PelicanArgs {
     #[arg(
         short = 'e',
         long = "environment",
-        help = "the environment variable file location for the pterodactyl panel",
-        default_value = "/var/www/pterodactyl/.env",
+        help = "the environment variable file location for the pelican panel",
+        default_value = "/var/www/pelican/.env",
         value_hint = clap::ValueHint::FilePath
     )]
     environment: String,
 }
 
-pub struct PterodactylCommand;
+pub struct PelicanCommand;
 
-impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCommand {
+impl shared::extensions::commands::CliCommand<PelicanArgs> for PelicanCommand {
     fn get_command(&self, command: clap::Command) -> clap::Command {
         command
     }
@@ -34,7 +92,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
     fn get_executor(self) -> Box<shared::extensions::commands::ExecutorFunc> {
         Box::new(|env, arg_matches| {
             Box::pin(async move {
-                let args = PterodactylArgs::from_arg_matches(&arg_matches)?;
+                let args = PelicanArgs::from_arg_matches(&arg_matches)?;
 
                 let start_time = std::time::Instant::now();
 
@@ -50,10 +108,10 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     }
                 };
 
-                if let Err(err) = dotenvy::from_path(args.environment) {
+                if let Err(err) = dotenvy::from_path(&args.environment) {
                     eprintln!(
                         "{}: {:#?}",
-                        "failed to read pterodactyl environment file".red(),
+                        "failed to read pelican environment file".red(),
                         err
                     );
 
@@ -65,7 +123,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     Err(err) => {
                         eprintln!(
                             "{}: {:#?}",
-                            "failed to read pterodactyl environment APP_URL".red(),
+                            "failed to read pelican environment APP_URL".red(),
                             err
                         );
 
@@ -81,99 +139,19 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     Err(err) => {
                         eprintln!(
                             "{}: {:#?}",
-                            "failed to read pterodactyl environment APP_KEY".red(),
+                            "failed to read pelican environment APP_KEY".red(),
                             err
                         );
 
                         return Ok(1);
                     }
                 };
-                let source_database_host = match std::env::var("DB_HOST") {
-                    Ok(value) => value,
-                    Err(err) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_HOST".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                };
-                let source_database_port = match std::env::var("DB_PORT").map(|v| v.parse::<u16>())
-                {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(err)) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_PORT".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_PORT".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                };
-                let source_database_database = match std::env::var("DB_DATABASE") {
-                    Ok(value) => value,
-                    Err(err) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_DATABASE".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                };
-                let source_database_username = match std::env::var("DB_USERNAME") {
-                    Ok(value) => value,
-                    Err(err) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_USERNAME".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                };
-                let source_database_password = match std::env::var("DB_PASSWORD") {
-                    Ok(value) => value,
-                    Err(err) => {
-                        eprintln!(
-                            "{}: {:#?}",
-                            "failed to read pterodactyl environment DB_PASSWORD".red(),
-                            err
-                        );
-
-                        return Ok(1);
-                    }
-                };
-
-                let source_database = sqlx::mysql::MySqlConnectOptions::new()
-                    .host(source_database_host.trim_matches('"'))
-                    .port(source_database_port)
-                    .database(source_database_database.trim_matches('"'))
-                    .username(source_database_username.trim_matches('"'))
-                    .password(source_database_password.trim_matches('"'));
-                let source_database = match sqlx::mysql::MySqlPoolOptions::new()
-                    .connect_with(source_database)
-                    .await
-                {
+                let source_database = match connect_source_database().await {
                     Ok(database) => database,
                     Err(err) => {
                         eprintln!(
                             "{}: {:#?}",
-                            "failed to connect to pterodactyl database".red(),
+                            "failed to connect to pelican database".red(),
                             err
                         );
 
@@ -198,7 +176,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                         let mut source_settings: HashMap<&str, compact_str::CompactString> = rows
                             .iter()
-                            .map(|r| (r.get("key"), r.get("value")))
+                            .map(|r| {
+                                (
+                                    r.get::<&str, _>("key"),
+                                    r.get::<&str, _>("value").to_compact_string(),
+                                )
+                            })
                             .collect();
 
                         settings.oobe_step = None;
@@ -243,6 +226,23 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     return Ok(1);
                 }
 
+                let admin_user_ids = match sqlx::query_scalar::<_, i32>(
+                    r#"
+                    SELECT DISTINCT model_id
+                    FROM model_has_roles
+                    WHERE model_type = 'user'
+                    "#,
+                )
+                .fetch_all(&source_database)
+                .await
+                {
+                    Ok(ids) => Arc::new(ids.into_iter().collect::<HashSet<i32>>()),
+                    Err(err) => {
+                        tracing::warn!("failed to load pelican role assignments: {:?}", err);
+                        Arc::new(HashSet::new())
+                    }
+                };
+
                 let user_mappings = match process_table(
                     &source_database,
                     "users",
@@ -252,30 +252,30 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                         let mut futures = Vec::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
 
                             mapping.insert(id, *uuid.as_uuid());
 
-                            let source_app_key = source_app_key.clone();
+                            let admin_user_ids = admin_user_ids.clone();
                             let database = database.clone();
                             futures.push(async move {
                                 let external_id: Option<&str> = row.try_get("external_id")?;
                                 let username: &str = row.try_get("username")?;
                                 let email: &str = row.try_get("email")?;
-                                let name_first: &str = row.try_get("name_first")?;
-                                let name_last: &str = row.try_get("name_last")?;
                                 let password: &str = row.try_get("password")?;
-                                let admin: bool = row.try_get("root_admin")?;
-                                let totp_enabled: bool = row.try_get("use_totp")?;
-                                let totp_secret: Option<compact_str::CompactString> = row.try_get::<Option<&str>, _>("totp_secret")?
-                                    .and_then(|s| decrypt_laravel_value(s, &source_app_key).ok());
+                                let language: Option<&str> = row.try_get("language")?;
+                                let mfa_app_secret: Option<&str> = row.try_get("mfa_app_secret")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+                                let (name_first, name_last) = derive_name_parts(username);
+                                let admin = admin_user_ids.contains(&id);
+                                let totp_secret = mfa_app_secret.map(compact_str::CompactString::from);
+                                let totp_enabled = totp_secret.is_some();
 
                                 sqlx::query(
                                     r#"
-                                    INSERT INTO users (uuid, external_id, username, email, name_first, name_last, password, admin, totp_enabled, totp_secret, created)
-                                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                    INSERT INTO users (uuid, external_id, username, email, name_first, name_last, password, admin, totp_enabled, totp_secret, language, created)
+                                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                                     ON CONFLICT DO NOTHING
                                     "#
                                 )
@@ -289,6 +289,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                 .bind(admin)
                                 .bind(totp_enabled)
                                 .bind(totp_secret)
+                                .bind(language.unwrap_or("en"))
                                 .bind(created)
                                 .execute(database.write())
                                 .await?;
@@ -323,7 +324,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             let user_mappings = user_mappings.clone();
                             let database = database.clone();
                             futures.push(async move {
-                                let user_id: u32 = row.try_get("user_id")?;
+                                let user_id: i32 = row.try_get("user_id")?;
                                 let name: &str = row.try_get("name")?;
                                 let public_key: &str = row.try_get("public_key")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
@@ -423,48 +424,58 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     row.get("uuid")
                 };
 
-                let location_mappings = match process_table(
-                    &source_database,
-                    "locations",
-                    None,
-                    async |rows| {
-                        let mut mapping: HashMap<u32, uuid::Uuid> =
-                            HashMap::with_capacity(rows.len());
+                let location_mappings = match async {
+                    let rows = sqlx::query("SELECT id, tags, created_at FROM nodes")
+                        .fetch_all(&source_database)
+                        .await?;
+                        let mut mapping = HashMap::with_capacity(rows.len());
+                        let mut created_locations: HashMap<compact_str::CompactString, uuid::Uuid> =
+                            HashMap::new();
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
-                            let short_name: &str = row.try_get("short")?;
-                            let description: Option<&str> = row.try_get("long")?;
-                            let created: chrono::DateTime<chrono::Utc> =
+                            let id: i32 = row.try_get("id")?;
+                            let tag = first_import_tag(
+                                row.try_get::<Option<&str>, _>("tags")?,
+                                "pelican",
+                            );
+                            let created: Option<chrono::DateTime<chrono::Utc>> =
                                 row.try_get("created_at")?;
 
-                            let row = sqlx::query(
-                                r#"
-                                INSERT INTO locations (backup_configuration_uuid, name, description, created)
-                                VALUES ($1, $2, $3, $4)
-                                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-                                RETURNING uuid
-                                "#,
-                            )
-                            .bind(backup_configuration_uuid)
-                            .bind(short_name)
-                            .bind(description)
-                            .bind(created)
-                            .fetch_one(database.write())
-                            .await?;
+                            let location_uuid = if let Some(uuid) = created_locations.get(&tag) {
+                                *uuid
+                            } else {
+                                let row = sqlx::query(
+                                    r#"
+                                    INSERT INTO locations (backup_configuration_uuid, name, description, created)
+                                    VALUES ($1, $2, $3, $4)
+                                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                                    RETURNING uuid
+                                    "#,
+                                )
+                                .bind(backup_configuration_uuid)
+                                .bind(&tag)
+                                .bind(Some(format!(
+                                    "generated from Pelican node tag `{tag}` during import"
+                                )))
+                                .bind(created.unwrap_or_else(chrono::Utc::now))
+                                .fetch_one(database.write())
+                                .await?;
 
-                            mapping.insert(id, row.get("uuid"));
+                                let uuid = row.get("uuid");
+                                created_locations.insert(tag, uuid);
+                                uuid
+                            };
+
+                            mapping.insert(id, location_uuid);
                         }
 
-                        Ok(mapping)
-                    },
-                    128,
-                )
+                        Ok::<Arc<HashMap<i32, uuid::Uuid>>, anyhow::Error>(Arc::new(mapping))
+                    }
                 .await
                 {
-                    Ok(mappings) => Arc::new(collect_mappings(mappings)),
+                    Ok(mappings) => mappings,
                     Err(err) => {
-                        tracing::error!("failed to process locations table: {:?}", err);
+                        tracing::error!("failed to synthesize locations from pelican tags: {:?}", err);
                         return Ok(1);
                     }
                 };
@@ -478,7 +489,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                         let mut futures = Vec::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
 
                             mapping.insert(id, *uuid.as_uuid());
@@ -491,18 +502,17 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                 let description: Option<&str> = row.try_get("description")?;
                                 let public: bool = row.try_get("public")?;
                                 let maintenance_mode: bool = row.try_get("maintenance_mode")?;
-                                let location_id: u32 = row.try_get("location_id")?;
                                 let fqdn: &str = row.try_get("fqdn")?;
                                 let scheme: &str = row.try_get("scheme")?;
-                                let memory: u64 = row.try_get("memory")?;
-                                let disk: u64 = row.try_get("disk")?;
+                                let memory: i64 = row.try_get("memory")?;
+                                let disk: i64 = row.try_get("disk")?;
                                 let token_id: &str = row.try_get("daemon_token_id")?;
                                 let token: &str = row.try_get("daemon_token")?;
-                                let daemon_listen: u16 = row.try_get("daemonListen")?;
-                                let daemon_sftp: u16 = row.try_get("daemonSFTP")?;
+                                let daemon_listen: i32 = row.try_get("daemon_listen")?;
+                                let daemon_sftp: i32 = row.try_get("daemon_sftp")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
-                                let location_uuid = match location_mappings.get(&location_id) {
+                                let location_uuid = match location_mappings.get(&id) {
                                     Some(uuid) => uuid,
                                     None => return Ok(()),
                                 };
@@ -531,9 +541,9 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                 .bind(maintenance_mode)
                                 .bind(location_uuid)
                                 .bind(url.to_string())
-                                .bind(daemon_sftp as i32)
-                                .bind(memory as i64)
-                                .bind(disk as i64)
+                                .bind(daemon_sftp)
+                                .bind(memory)
+                                .bind(disk)
                                 .bind(token_id)
                                 .bind(database.encrypt(token).await.unwrap_or_default())
                                 .bind(created)
@@ -561,54 +571,59 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                 drop(location_mappings);
 
-                let nest_mappings = match process_table(
-                    &source_database,
-                    "nests",
-                    None,
-                    async |rows| {
+                let nest_mappings = match async {
+                    let rows = sqlx::query("SELECT id, author, tags, created_at FROM eggs")
+                        .fetch_all(&source_database)
+                        .await?;
                         let mut mapping = HashMap::with_capacity(rows.len());
+                        let mut created_nests: HashMap<compact_str::CompactString, uuid::Uuid> =
+                            HashMap::new();
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
-                            let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
+                            let id: i32 = row.try_get("id")?;
                             let author: &str = row.try_get("author")?;
-                            let name: &str = row.try_get("name")?;
-                            let description: Option<&str> = row.try_get("description")?;
-                            let created: chrono::DateTime<chrono::Utc> =
+                            let tag = first_import_tag(
+                                row.try_get::<Option<&str>, _>("tags")?,
+                                "pelican",
+                            );
+                            let created: Option<chrono::DateTime<chrono::Utc>> =
                                 row.try_get("created_at")?;
 
-                            let row = sqlx::query(
-                                r#"
-                                INSERT INTO nests (uuid, author, name, description, created)
-                                VALUES ($1, $2, $3, $4, $5)
-                                ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description
-                                RETURNING uuid
-                                "#,
-                            )
-                            .bind(uuid.as_uuid())
-                            .bind(author)
-                            .bind(name)
-                            .bind(description)
-                            .bind(created)
-                            .fetch_one(database.write())
-                            .await?;
+                            let nest_uuid = if let Some(uuid) = created_nests.get(&tag) {
+                                *uuid
+                            } else {
+                                let row = sqlx::query(
+                                    r#"
+                                    INSERT INTO nests (author, name, description, created)
+                                    VALUES ($1, $2, $3, $4)
+                                    ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description
+                                    RETURNING uuid
+                                    "#,
+                                )
+                                .bind(author)
+                                .bind(&tag)
+                                .bind(Some(format!(
+                                    "generated from Pelican egg tag `{tag}` during import"
+                                )))
+                                .bind(created.unwrap_or_else(chrono::Utc::now))
+                                .fetch_one(database.write())
+                                .await?;
 
-                            mapping.insert(id, row.get("uuid"));
+                                let uuid = row.get("uuid");
+                                created_nests.insert(tag, uuid);
+                                uuid
+                            };
+
+                            mapping.insert(id, nest_uuid);
                         }
 
-                        Ok(mapping)
-                    },
-                    256,
-                )
+                        Ok::<Arc<HashMap<i32, uuid::Uuid>>, anyhow::Error>(Arc::new(mapping))
+                    }
                 .await
                 {
-                    Ok(mappings) => Arc::new(mappings.into_iter().flatten().collect::<HashMap<
-                        u32,
-                        uuid::Uuid,
-                    >>(
-                    )),
+                    Ok(mappings) => mappings,
                     Err(err) => {
-                        tracing::error!("failed to process nests table: {:?}", err);
+                        tracing::error!("failed to synthesize nests from pelican tags: {:?}", err);
                         return Ok(1);
                     }
                 };
@@ -621,52 +636,63 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                         let mut mapping = HashMap::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
-                            let nest_id: u32 = row.try_get("nest_id")?;
                             let author: &str = row.try_get("author")?;
                             let name: &str = row.try_get("name")?;
                             let description: Option<&str> = row.try_get("description")?;
-                            let features: Option<serde_json::Value> = row.try_get("features")?;
-                            let docker_images: serde_json::Value = row.try_get("docker_images")?;
-                            let file_denylist: Option<serde_json::Value> =
-                                row.try_get("file_denylist")?;
-                            let config_files: Option<serde_json::Value> =
-                                row.try_get("config_files")?;
-                            let config_startup: Option<serde_json::Value> =
-                                row.try_get("config_startup")?;
-                            let config_stop: Option<compact_str::CompactString> = row.try_get("config_stop")?;
+                            let features: Option<&str> = row.try_get("features")?;
+                            let docker_images: &str = row.try_get("docker_images")?;
+                            let file_denylist: Option<&str> = row.try_get("file_denylist")?;
+                            let config_files: Option<&str> = row.try_get("config_files")?;
+                            let config_startup: Option<&str> = row.try_get("config_startup")?;
+                            let config_stop = row
+                                .try_get::<Option<&str>, _>("config_stop")?
+                                .map(compact_str::CompactString::from);
                             let config_script = shared::models::nest_egg::NestEggConfigScript {
                                 container: row.try_get("script_container")?,
                                 entrypoint: row.try_get("script_entry")?,
                                 content: row.try_get("script_install").unwrap_or_default(),
                             };
-                            let startup: &str = row.try_get("startup")?;
+                            let startup_commands: Option<&str> = row.try_get("startup_commands")?;
                             let force_outgoing_ip: bool = row.try_get("force_outgoing_ip")?;
                             let created: chrono::DateTime<chrono::Utc> =
                                 row.try_get("created_at")?;
 
-                            let nest_uuid = match nest_mappings.get(&nest_id) {
+                            let nest_uuid = match nest_mappings.get(&id) {
                                 Some(uuid) => uuid,
                                 None => continue,
                             };
 
-                            let features: Vec<String> = serde_json::from_value(
-                                features.unwrap_or_else(|| serde_json::Value::Array(vec![])),
-                            )
-                            .unwrap_or_default();
-                            let file_denylist: Vec<String> = serde_json::from_value(
-                                file_denylist.unwrap_or_else(|| serde_json::Value::Array(vec![])),
-                            )
-                            .unwrap_or_default();
+                            let features: Vec<String> = features
+                                .and_then(|value| serde_json::from_str(value).ok())
+                                .unwrap_or_default();
+                            let docker_images: serde_json::Value =
+                                serde_json::from_str(docker_images).unwrap_or_default();
+                            let file_denylist: Vec<String> = file_denylist
+                                .and_then(|value| serde_json::from_str(value).ok())
+                                .unwrap_or_default();
 
                             let config_files: Vec<
                                 shared::models::nest_egg::ProcessConfigurationFile,
-                            > = serde_json::from_value(config_files.unwrap_or_default())
+                            > = config_files
+                                .and_then(|value| serde_json::from_str(value).ok())
                                 .unwrap_or_default();
                             let mut config_startup: shared::models::nest_egg::NestEggConfigStartup =
-                                serde_json::from_value(config_startup.unwrap_or_default())
+                                config_startup
+                                    .and_then(|value| serde_json::from_str(value).ok())
                                     .unwrap_or_default();
+                            let startup = startup_commands
+                                .and_then(|value| {
+                                    serde_json::from_str::<HashMap<String, String>>(value)
+                                        .ok()
+                                        .and_then(|mut commands| {
+                                            commands
+                                                .remove("Default")
+                                                .or_else(|| commands.into_values().next())
+                                        })
+                                })
+                                .unwrap_or_default();
                             let config_stop: shared::models::nest_egg::NestEggConfigStop =
                                 serde_json::from_str(config_stop.as_deref().unwrap_or(""))
                                     .unwrap_or_else(|_| {
@@ -741,11 +767,11 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     "egg_variables",
                     None,
                     async |rows| {
-                        let mut mapping: HashMap<u32, uuid::Uuid> = HashMap::with_capacity(rows.len());
+                        let mut mapping: HashMap<i32, uuid::Uuid> = HashMap::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
-                            let egg_id: u32 = row.try_get("egg_id")?;
+                            let id: i32 = row.try_get("id")?;
+                            let egg_id: i32 = row.try_get("egg_id")?;
                             let name: &str = row.try_get("name")?;
                             let description: Option<&str> = row.try_get("description")?;
                             let env_variable: &str = row.try_get("env_variable")?;
@@ -807,14 +833,14 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     "database_hosts",
                     None,
                     async |rows| {
-                        let mut mapping: HashMap<u32, uuid::Uuid> =
+                        let mut mapping: HashMap<i32, uuid::Uuid> =
                             HashMap::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let name: &str = row.try_get("name")?;
                             let host: &str = row.try_get("host")?;
-                            let port: u16 = row.try_get("port")?;
+                            let port: i32 = row.try_get("port")?;
                             let username: &str = row.try_get("username")?;
                             let password: &str = row.try_get("password")?;
                             let created: chrono::DateTime<chrono::Utc> =
@@ -827,7 +853,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                             let mut credentials = DatabaseCredentials::Details {
                                 host: host.into(),
-                                port,
+                                port: port as u16,
                                 username: username.into(),
                                 password,
                             };
@@ -874,9 +900,9 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                         let mut futures = Vec::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
-                            let allocation_id: u32 = row.try_get("allocation_id")?;
+                            let allocation_id: Option<i32> = row.try_get("allocation_id")?;
 
                             mapping.insert(id, (*uuid.as_uuid(), allocation_id));
 
@@ -886,22 +912,22 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             let database = database.clone();
                             futures.push(async move {
                                 let external_id: Option<&str> = row.try_get("external_id")?;
-                                let node_id: u32 = row.try_get("node_id")?;
+                                let node_id: i32 = row.try_get("node_id")?;
                                 let name: &str = row.try_get("name")?;
                                 let description: Option<&str> = row.try_get("description")?;
                                 let status: Option<&str> = row.try_get("status")?;
-                                let owner_id: u32 = row.try_get("owner_id")?;
-                                let memory: u32 = row.try_get("memory")?;
+                                let owner_id: i32 = row.try_get("owner_id")?;
+                                let memory: i32 = row.try_get("memory")?;
                                 let swap: i32 = row.try_get("swap")?;
-                                let disk: u32 = row.try_get("disk")?;
-                                let io_weight: u32 = row.try_get("io")?;
-                                let cpu: u32 = row.try_get("cpu")?;
-                                let egg_id: u32 = row.try_get("egg_id")?;
+                                let disk: i32 = row.try_get("disk")?;
+                                let io_weight: i32 = row.try_get("io")?;
+                                let cpu: i32 = row.try_get("cpu")?;
+                                let egg_id: i32 = row.try_get("egg_id")?;
                                 let startup: &str = row.try_get("startup")?;
                                 let image: &str = row.try_get("image")?;
-                                let allocation_limit: u32 = row.try_get("allocation_limit")?;
-                                let database_limit: u32 = row.try_get("database_limit")?;
-                                let backup_limit: u32 = row.try_get("backup_limit")?;
+                                let allocation_limit: Option<i32> = row.try_get("allocation_limit")?;
+                                let database_limit: i32 = row.try_get("database_limit")?;
+                                let backup_limit: i32 = row.try_get("backup_limit")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
                                 let node_uuid = match node_mappings.get(&node_id) {
@@ -954,11 +980,11 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                 .bind(swap as i64)
                                 .bind(disk as i64)
                                 .bind(io_weight as i16)
-                                .bind(cpu as i32)
+                                .bind(cpu)
                                 .bind(&[] as &[i32])
-                                .bind(allocation_limit as i32)
-                                .bind(database_limit as i32)
-                                .bind(backup_limit as i32)
+                                .bind(allocation_limit.unwrap_or_default())
+                                .bind(database_limit)
+                                .bind(backup_limit)
                                 .bind(egg_uuid)
                                 .bind(startup)
                                 .bind(image)
@@ -978,7 +1004,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                 )
                 .await
                 {
-                    Ok(mappings) => Arc::new(mappings.into_iter().flatten().collect::<HashMap<u32, (uuid::Uuid, u32)>>()),
+                    Ok(mappings) => Arc::new(
+                        mappings
+                            .into_iter()
+                            .flatten()
+                            .collect::<HashMap<i32, (uuid::Uuid, Option<i32>)>>(),
+                    ),
                     Err(err) => {
                         tracing::error!("failed to process servers table: {:?}", err);
                         return Ok(1);
@@ -998,8 +1029,8 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             let source_app_key = source_app_key.clone();
                             let database = database.clone();
                             futures.push(async move {
-                                let server_id: u32 = row.try_get("server_id")?;
-                                let database_host_id: u32 = row.try_get("database_host_id")?;
+                                let server_id: i32 = row.try_get("server_id")?;
+                                let database_host_id: i32 = row.try_get("database_host_id")?;
                                 let database_name: &str = row.try_get("database")?;
                                 let username: &str = row.try_get("username")?;
                                 let password: &str = row.try_get("password")?;
@@ -1058,8 +1089,8 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     None,
                     async |rows| {
                         for row in rows {
-                            let server_id: u32 = row.try_get("server_id")?;
-                            let variable_id: u32 = row.try_get("variable_id")?;
+                            let server_id: i32 = row.try_get("server_id")?;
+                            let variable_id: i32 = row.try_get("variable_id")?;
                             let variable_value: Option<&str> = row.try_get("variable_value")?;
                             let created: Option<chrono::DateTime<chrono::Utc>> =
                                 row.try_get("created_at")?;
@@ -1111,14 +1142,14 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             let database = database.clone();
                             futures.push(async move {
                                 let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
-                                let server_id: u32 = row.try_get("server_id")?;
+                                let server_id: i32 = row.try_get("server_id")?;
                                 let successful: bool = row.try_get("is_successful")?;
                                 let locked: bool = row.try_get("is_locked")?;
                                 let name: &str = row.try_get("name")?;
-                                let ignored_files: Option<serde_json::Value> = row.try_get("ignored_files")?;
+                                let ignored_files: Option<&str> = row.try_get("ignored_files")?;
                                 let disk: &str = row.try_get("disk")?;
                                 let checksum: Option<&str> = row.try_get("checksum")?;
-                                let bytes: u64 = row.try_get("bytes")?;
+                                let bytes: i64 = row.try_get("bytes")?;
                                 let completed: Option<chrono::DateTime<chrono::Utc>> = row.try_get("completed_at")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
                                 let deleted: Option<chrono::DateTime<chrono::Utc>> = row.try_get("deleted_at")?;
@@ -1128,10 +1159,9 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                     None => return Ok(()),
                                 };
 
-                                let ignored_files: Vec<String> = serde_json::from_value(
-                                    ignored_files.unwrap_or_else(|| serde_json::Value::Array(vec![])),
-                                )
-                                .unwrap_or_default();
+                                let ignored_files: Vec<String> = ignored_files
+                                    .and_then(|value| serde_json::from_str(value).ok())
+                                    .unwrap_or_default();
 
                                 sqlx::query(
                                     r#"
@@ -1159,7 +1189,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                     _ => shared::models::server_backup::BackupDisk::Local,
                                 })
                                 .bind(checksum)
-                                .bind(bytes as i64)
+                                .bind(bytes)
                                 .bind(completed)
                                 .bind(deleted)
                                 .bind(created)
@@ -1194,9 +1224,9 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             let server_mappings = server_mappings.clone();
                             let database = database.clone();
                             futures.push(async move {
-                                let user_id: u32 = row.try_get("user_id")?;
-                                let server_id: u32 = row.try_get("server_id")?;
-                                let permissions: serde_json::Value = row.try_get("permissions")?;
+                                let user_id: i32 = row.try_get("user_id")?;
+                                let server_id: i32 = row.try_get("server_id")?;
+                                let permissions: Option<&str> = row.try_get("permissions")?;
                                 let created: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
                                 let user_uuid = match user_mappings.get(&user_id) {
@@ -1209,8 +1239,9 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                     None => return Ok(()),
                                 };
 
-                                let raw_permissions: Vec<String> =
-                                    serde_json::from_value(permissions).unwrap_or_default();
+                                let raw_permissions: Vec<String> = permissions
+                                    .and_then(|value| serde_json::from_str(value).ok())
+                                    .unwrap_or_default();
                                 let mut permissions = HashSet::with_capacity(raw_permissions.len());
 
                                 for permission in raw_permissions {
@@ -1302,7 +1333,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                         let mut mapping = HashMap::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
+                            let id: i32 = row.try_get("id")?;
                             let uuid: uuid::fmt::Hyphenated = row.try_get("uuid")?;
                             let name: &str = row.try_get("name")?;
                             let description: Option<&str> = row.try_get("description")?;
@@ -1346,12 +1377,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                 if let Err(err) = process_table(
                     &source_database,
-                    "egg_mount",
-                    None,
+                    "mountables",
+                    Some("LOWER(mountable_type) = 'egg'"),
                     async |rows| {
                         for row in rows {
-                            let egg_id: u32 = row.try_get("egg_id")?;
-                            let mount_id: u32 = row.try_get("mount_id")?;
+                            let egg_id: i32 = row.try_get("mountable_id")?;
+                            let mount_id: i32 = row.try_get("mount_id")?;
 
                             let egg_uuid = match egg_mappings.get(&egg_id) {
                                 Some(uuid) => uuid,
@@ -1388,12 +1419,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                 if let Err(err) = process_table(
                     &source_database,
-                    "mount_node",
-                    None,
+                    "mountables",
+                    Some("LOWER(mountable_type) = 'node'"),
                     async |rows| {
                         for row in rows {
-                            let node_id: u32 = row.try_get("node_id")?;
-                            let mount_id: u32 = row.try_get("mount_id")?;
+                            let node_id: i32 = row.try_get("mountable_id")?;
+                            let mount_id: i32 = row.try_get("mount_id")?;
 
                             let node_uuid = match node_mappings.get(&node_id) {
                                 Some(uuid) => uuid,
@@ -1430,12 +1461,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
 
                 if let Err(err) = process_table(
                     &source_database,
-                    "mount_server",
-                    None,
+                    "mountables",
+                    Some("LOWER(mountable_type) = 'server'"),
                     async |rows| {
                         for row in rows {
-                            let server_id: u32 = row.try_get("server_id")?;
-                            let mount_id: u32 = row.try_get("mount_id")?;
+                            let server_id: i32 = row.try_get("mountable_id")?;
+                            let mount_id: i32 = row.try_get("mount_id")?;
 
                             let server_uuid = match server_mappings.get(&server_id) {
                                 Some((uuid, _)) => uuid,
@@ -1477,11 +1508,11 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     "schedules",
                     None,
                     async |rows| {
-                        let mut mapping: HashMap<u32, uuid::Uuid> = HashMap::with_capacity(rows.len());
+                        let mut mapping: HashMap<i32, uuid::Uuid> = HashMap::with_capacity(rows.len());
 
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
-                            let server_id: u32 = row.try_get("server_id")?;
+                            let id: i32 = row.try_get("id")?;
+                            let server_id: i32 = row.try_get("server_id")?;
                             let name: &str = row.try_get("name")?;
                             let enabled: bool = row.try_get("is_active")?;
                             let only_when_online: bool = row.try_get("only_when_online")?;
@@ -1561,11 +1592,11 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     None,
                     async |rows| {
                         for row in rows {
-                            let schedule_id: u32 = row.try_get("schedule_id")?;
-                            let sequence_id: u32 = row.try_get("sequence_id")?;
+                            let schedule_id: i32 = row.try_get("schedule_id")?;
+                            let sequence_id: i32 = row.try_get("sequence_id")?;
                             let action: &str = row.try_get("action")?;
                             let payload: &str = row.try_get("payload")?;
-                            let time_offset: u32 = row.try_get("time_offset")?;
+                            let time_offset: i32 = row.try_get("time_offset")?;
                             let continue_on_failure: bool = row.try_get("continue_on_failure")?;
                             let created: chrono::DateTime<chrono::Utc> =
                                 row.try_get("created_at")?;
@@ -1654,12 +1685,12 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                     None,
                     async |rows| {
                         for row in rows {
-                            let id: u32 = row.try_get("id")?;
-                            let node_id: u32 = row.try_get("node_id")?;
+                            let id: i32 = row.try_get("id")?;
+                            let node_id: i32 = row.try_get("node_id")?;
                             let ip: &str = row.try_get("ip")?;
                             let ip_alias: Option<&str> = row.try_get("ip_alias")?;
-                            let port: u16 = row.try_get("port")?;
-                            let server_id: Option<u32> = row.try_get("server_id")?;
+                            let port: i32 = row.try_get("port")?;
+                            let server_id: Option<i32> = row.try_get("server_id")?;
                             let notes: Option<&str> = if server_id.is_some() {
                                 row.try_get("notes")?
                             } else {
@@ -1694,7 +1725,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                             .bind(node_uuid)
                             .bind(ip)
                             .bind(ip_alias)
-                            .bind(port as i32)
+                            .bind(port)
                             .fetch_one(database.write())
                             .await?;
 
@@ -1714,7 +1745,7 @@ impl shared::extensions::commands::CliCommand<PterodactylArgs> for PterodactylCo
                                 .fetch_one(database.write())
                                 .await?;
 
-                                if id == allocation_id {
+                                if allocation_id.is_some_and(|allocation_id| id == allocation_id) {
                                     sqlx::query(
                                         r#"
                                         UPDATE servers
